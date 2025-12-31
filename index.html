@@ -54,4 +54,187 @@
   <h1>Telemetry Dashboard</h1>
 
   <!-- 操作エリア -->
-  <di
+  <div class="row" style="margin-bottom: 12px;">
+    <label>
+      Device:
+      <select id="deviceSelect"></select>
+    </label>
+
+    <span>表示範囲:</span>
+    <button onclick="setRange(1)"  id="btn1h">1h</button>
+    <button onclick="setRange(6)"  id="btn6h">6h</button>
+    <button onclick="setRange(24)" id="btn24h">24h</button>
+
+    <button onclick="refreshAll()">手動更新</button>
+
+    <span class="muted" id="status"></span>
+  </div>
+
+  <!-- 表示エリア -->
+  <div class="row">
+    <div class="card small">
+      <h3 style="margin-top:0;">最新値</h3>
+      <div style="font-size: 28px; font-weight: 700;" id="latestValue">-</div>
+      <div class="muted" id="latestMeta">-</div>
+    </div>
+
+    <div class="card large">
+      <h3 style="margin-top:0;">トレンド</h3>
+      <canvas id="trendChart"></canvas>
+    </div>
+  </div>
+
+<script>
+/* ===================== 設定 ===================== */
+const SUPABASE_URL = "https://modjfdtgkxkvxdcffcyx.supabase.co";
+const SUPABASE_ANON_KEY = "sb_publishable_IHKNNw2t8AWE2yKyPX8sSA_W11U4wHU";
+const TABLE = "telemetry";
+
+const COL_TS = "ts";
+const COL_DEVICE = "device";
+const COL_VALUE = "value";
+const COL_UNIT = "unit";
+const COL_QUALITY = "quality";
+
+// 自動更新（①）
+const AUTO_REFRESH_MINUTES = 20;
+const AUTO_REFRESH_MS = AUTO_REFRESH_MINUTES * 60 * 1000;
+
+// 初期表示レンジ（②）
+let rangeHours = 24;
+/* =============================================== */
+
+const REST_BASE = `${SUPABASE_URL}/rest/v1/${TABLE}`;
+let chart;
+
+/* ---------- 共通 ---------- */
+function headers() {
+  return {
+    apikey: SUPABASE_ANON_KEY,
+    Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
+    "Content-Type": "application/json"
+  };
+}
+
+function isoHoursAgo(hours) {
+  return new Date(Date.now() - hours * 3600 * 1000).toISOString();
+}
+
+function fmtTime(iso) {
+  const d = new Date(iso);
+  return d.toLocaleTimeString();
+}
+
+function setStatus(msg) {
+  document.getElementById("status").textContent = msg;
+}
+
+/* ---------- Supabase fetch ---------- */
+async function fetchDevices() {
+  const url = `${REST_BASE}?select=${COL_DEVICE}&limit=10000`;
+  const res = await fetch(url, { headers: headers() });
+  const rows = await res.json();
+  return [...new Set(rows.map(r => r[COL_DEVICE]).filter(Boolean))].sort();
+}
+
+async function fetchLatest(device) {
+  const url =
+    `${REST_BASE}?select=${COL_TS},${COL_VALUE},${COL_UNIT},${COL_QUALITY}` +
+    `&${COL_DEVICE}=eq.${device}` +
+    `&order=${COL_TS}.desc&limit=1`;
+
+  const res = await fetch(url, { headers: headers() });
+  const rows = await res.json();
+  return rows[0] || null;
+}
+
+async function fetchTrend(device) {
+  const from = isoHoursAgo(rangeHours);
+  const url =
+    `${REST_BASE}?select=${COL_TS},${COL_VALUE}` +
+    `&${COL_DEVICE}=eq.${device}` +
+    `&${COL_TS}=gte.${from}` +
+    `&order=${COL_TS}.asc`;
+
+  const res = await fetch(url, { headers: headers() });
+  return await res.json();
+}
+
+/* ---------- 描画 ---------- */
+function renderLatest(rec) {
+  if (!rec) return;
+  document.getElementById("latestValue").textContent =
+    `${rec[COL_VALUE]} ${rec[COL_UNIT] || ""}`;
+  document.getElementById("latestMeta").textContent =
+    `${fmtTime(rec[COL_TS])} / Quality: ${rec[COL_QUALITY] || ""}`;
+}
+
+function renderChart(rows) {
+  const labels = rows.map(r => fmtTime(r[COL_TS]));
+  const values = rows.map(r => Number(r[COL_VALUE]));
+
+  if (chart) chart.destroy();
+
+  chart = new Chart(document.getElementById("trendChart"), {
+    type: "line",
+    data: {
+      labels,
+      datasets: [{
+        label: `Value（直近 ${rangeHours}h）`,
+        data: values,
+        tension: 0.3
+      }]
+    },
+    options: {
+      responsive: true,
+      scales: {
+        x: { title: { display: true, text: "Time" } },
+        y: { title: { display: true, text: "Value" } }
+      }
+    }
+  });
+}
+
+/* ---------- 操作 ---------- */
+function setRange(h) {
+  rangeHours = h;
+  ["btn1h", "btn6h", "btn24h"].forEach(id =>
+    document.getElementById(id).classList.remove("active")
+  );
+  document.getElementById(`btn${h}h`).classList.add("active");
+  refreshAll();
+}
+
+async function refreshAll() {
+  const device = document.getElementById("deviceSelect").value;
+  if (!device) return;
+
+  setStatus("更新中...");
+  try {
+    renderLatest(await fetchLatest(device));
+    renderChart(await fetchTrend(device));
+    setStatus(`更新: ${new Date().toLocaleString()}`);
+  } catch (e) {
+    setStatus(`エラー: ${e.message}`);
+  }
+}
+
+/* ---------- 初期化 ---------- */
+async function init() {
+  setStatus("初期化中...");
+  const devices = await fetchDevices();
+  const sel = document.getElementById("deviceSelect");
+  sel.innerHTML = devices.map(d => `<option>${d}</option>`).join("");
+  sel.addEventListener("change", refreshAll);
+
+  document.getElementById("btn24h").classList.add("active");
+  await refreshAll();
+
+  // ★① 自動更新（20分）
+  setInterval(refreshAll, AUTO_REFRESH_MS);
+}
+
+init();
+</script>
+</body>
+</html>
