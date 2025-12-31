@@ -3,90 +3,205 @@
 <head>
   <meta charset="UTF-8" />
   <title>Telemetry Dashboard</title>
-
-  <!-- Chart.js CDN -->
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-
   <style>
-    body {
-      font-family: Arial, sans-serif;
-      margin: 40px;
-      background: #f5f5f5;
-    }
-    h1 {
-      margin-bottom: 20px;
-    }
-    .chart-container {
-      width: 800px;
-      background: #ffffff;
-      padding: 20px;
-      border-radius: 8px;
-    }
+    body { font-family: Arial, sans-serif; margin: 24px; background: #f5f5f5; }
+    .row { display: flex; gap: 16px; flex-wrap: wrap; }
+    .card { background: #fff; border-radius: 10px; padding: 16px; }
+    .card.small { width: 320px; }
+    .card.large { flex: 1; min-width: 520px; }
+    .muted { color: #666; font-size: 12px; }
+    select, button { padding: 8px 10px; }
   </style>
 </head>
-
 <body>
   <h1>Telemetry Dashboard</h1>
 
-  <div class="chart-container">
-    <canvas id="trendChart"></canvas>
+  <div class="row" style="align-items:center; margin-bottom: 12px;">
+    <label>Device:
+      <select id="deviceSelect"></select>
+    </label>
+    <button id="refreshBtn">更新</button>
+    <span class="muted" id="status"></span>
   </div>
 
-  <script>
-    // ダミーの時系列データ
-    const labels = [
-      "12:00",
-      "12:05",
-      "12:10",
-      "12:15",
-      "12:20",
-      "12:25"
-    ];
+  <div class="row">
+    <div class="card small">
+      <h3 style="margin-top:0;">最新値</h3>
+      <div style="font-size: 28px; font-weight: 700;" id="latestValue">-</div>
+      <div class="muted" id="latestMeta">-</div>
+    </div>
 
-    const data = {
-      labels: labels,
-      datasets: [
-        {
-          label: "Pressure (MPa)",
-          data: [0.20, 0.21, 0.23, 0.22, 0.24, 0.25],
-          borderColor: "rgb(54, 162, 235)",
-          backgroundColor: "rgba(54, 162, 235, 0.2)",
-          tension: 0.3
-        }
-      ]
-    };
+    <div class="card large">
+      <h3 style="margin-top:0;">トレンド（直近100点）</h3>
+      <canvas id="trendChart"></canvas>
+    </div>
+  </div>
 
-    const config = {
-      type: "line",
-      data: data,
-      options: {
-        responsive: true,
-        plugins: {
-          legend: {
-            position: "top"
-          }
-        },
-        scales: {
-          y: {
-            title: {
-              display: true,
-              text: "MPa"
-            }
-          },
-          x: {
-            title: {
-              display: true,
-              text: "Time"
-            }
-          }
-        }
+<script>
+/** ====== あなたの環境に合わせてここだけ変更 ====== */
+const SUPABASE_URL = "https://modjfdtgkxkvxdcffcyx.supabase.co";
+const SUPABASE_ANON_KEY = "sb_publishable_IHKNNw2t8AWE2yKyPX8sSA_W11U4wHU";
+const TABLE = "telemetry"; // ← テーブル名
+
+// カラム名（あなたの実テーブルに合わせる）
+const COL_TS = "ts";
+const COL_DEVICE = "device";
+const COL_VALUE = "value";
+const COL_UNIT = "unit";
+const COL_QUALITY = "quality";
+/** ============================================ */
+
+// REST API base
+const REST_BASE = `${SUPABASE_URL}/rest/v1/${TABLE}`;
+
+function headers() {
+  return {
+    "apikey": SUPABASE_ANON_KEY,
+    "Authorization": `Bearer ${SUPABASE_ANON_KEY}`,
+    "Content-Type": "application/json"
+  };
+}
+
+// 便利：ISO文字列を短く表示
+function fmtTime(iso) {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso;
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+}
+
+const statusEl = document.getElementById("status");
+function setStatus(msg) { statusEl.textContent = msg; }
+
+let chart;
+
+async function fetchDevices() {
+  // device のユニークを取る（select=device で全件→JSでユニーク化）
+  // データ量が多い場合は「別テーブル/ビュー」でdevice一覧を持つのが理想
+  const url = `${REST_BASE}?select=${encodeURIComponent(COL_DEVICE)}&limit=10000`;
+  const res = await fetch(url, { headers: headers() });
+  if (!res.ok) throw new Error(`devices fetch failed: ${res.status} ${await res.text()}`);
+  const rows = await res.json();
+
+  const set = new Set(rows.map(r => r[COL_DEVICE]).filter(Boolean));
+  return Array.from(set).sort();
+}
+
+async function fetchLatest(device) {
+  const selectCols = [COL_TS, COL_DEVICE, COL_VALUE, COL_UNIT, COL_QUALITY].join(",");
+  const url =
+    `${REST_BASE}?select=${encodeURIComponent(selectCols)}` +
+    `&${COL_DEVICE}=eq.${encodeURIComponent(device)}` +
+    `&order=${COL_TS}.desc&limit=1`;
+
+  const res = await fetch(url, { headers: headers() });
+  if (!res.ok) throw new Error(`latest fetch failed: ${res.status} ${await res.text()}`);
+  const rows = await res.json();
+  return rows[0] || null;
+}
+
+async function fetchTrend(device, limit=100) {
+  const selectCols = [COL_TS, COL_DEVICE, COL_VALUE, COL_UNIT, COL_QUALITY].join(",");
+  const url =
+    `${REST_BASE}?select=${encodeURIComponent(selectCols)}` +
+    `&${COL_DEVICE}=eq.${encodeURIComponent(device)}` +
+    `&order=${COL_TS}.desc&limit=${limit}`;
+
+  const res = await fetch(url, { headers: headers() });
+  if (!res.ok) throw new Error(`trend fetch failed: ${res.status} ${await res.text()}`);
+  const rows = await res.json();
+
+  // descで来るのでチャート用に昇順へ
+  rows.reverse();
+  return rows;
+}
+
+function renderLatest(rec) {
+  const v = rec ? rec[COL_VALUE] : "-";
+  const u = rec ? (rec[COL_UNIT] || "") : "";
+  const q = rec ? (rec[COL_QUALITY] || "") : "";
+  const ts = rec ? rec[COL_TS] : "";
+
+  document.getElementById("latestValue").textContent = `${v} ${u}`.trim();
+  document.getElementById("latestMeta").textContent =
+    `${fmtTime(ts)}  /  Quality: ${q}`.trim();
+}
+
+function renderChart(rows) {
+  const labels = rows.map(r => fmtTime(r[COL_TS]));
+  const values = rows.map(r => Number(r[COL_VALUE]));
+
+  const data = {
+    labels,
+    datasets: [{
+      label: "Value",
+      data: values,
+      tension: 0.25
+    }]
+  };
+
+  const cfg = {
+    type: "line",
+    data,
+    options: {
+      responsive: true,
+      plugins: { legend: { position: "top" } },
+      scales: {
+        y: { title: { display: true, text: "Value" } },
+        x: { title: { display: true, text: "Time" } }
       }
-    };
+    }
+  };
 
-    new Chart(
-      document.getElementById("trendChart"),
-      config
-    );
-  </script>
+  const ctx = document.getElementById("trendChart");
+  if (chart) chart.destroy();
+  chart = new Chart(ctx, cfg);
+}
+
+async function refreshAll() {
+  const sel = document.getElementById("deviceSelect");
+  const device = sel.value;
+  if (!device) return;
+
+  setStatus("取得中...");
+  try {
+    const latest = await fetchLatest(device);
+    renderLatest(latest);
+
+    const trend = await fetchTrend(device, 100);
+    renderChart(trend);
+
+    setStatus(`更新: ${new Date().toLocaleString()}`);
+  } catch (e) {
+    console.error(e);
+    setStatus(`エラー: ${e.message}`);
+  }
+}
+
+async function init() {
+  setStatus("初期化中...");
+  try {
+    const devices = await fetchDevices();
+    const sel = document.getElementById("deviceSelect");
+    sel.innerHTML = devices.map(d => `<option value="${d}">${d}</option>`).join("");
+
+    sel.addEventListener("change", refreshAll);
+    document.getElementById("refreshBtn").addEventListener("click", refreshAll);
+
+    if (devices.length === 0) {
+      setStatus("Deviceが取得できません（RLS/テーブル名/列名を確認）");
+      return;
+    }
+
+    await refreshAll();
+  } catch (e) {
+    console.error(e);
+    setStatus(`初期化エラー: ${e.message}`);
+  }
+}
+
+init();
+</script>
 </body>
 </html>
